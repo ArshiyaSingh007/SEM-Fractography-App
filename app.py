@@ -248,6 +248,7 @@ with st.sidebar:
     DIMPLE_REGION  = st.radio("Count dimples in", ["ductile", "all"], index=0 if DIMPLE_REGION == "ductile" else 1,
                               format_func=lambda v: "ductile-evidence tiles only" if v == "ductile" else "whole image")
     st.subheader("About the model")
+    st.caption("Trained on 6000× SEM images only (see the notice at the top of the page).")
     st.caption("Frozen ResNet50 tile features + Additive MIL head, trained on all labelled images. Scores for images that were in training are optimistic.")
     if CV: st.caption(f"Held-out (cross-validated, {CV['n']} images): AUC {CV['auc']:.2f}, balanced accuracy {CV['bacc']:.2f}. Wide error bars. Brittle area has not been checked against hand-drawn outlines.")
 
@@ -321,6 +322,16 @@ def single_section():
             st.dataframe(pd.DataFrame([row]).T.rename(columns={0: "value"}).astype(str))
             st.download_button("Download summary (CSV)", pd.DataFrame([row]).to_csv(index=False), f"{os.path.splitext(f.name)[0]}_summary.csv", "text/csv", key=f"s{tag}")
             st.download_button("Download per-dimple table (CSV)", tab.to_csv(index=False), f"{os.path.splitext(f.name)[0]}_dimples.csv", "text/csv", key=f"d{tag}")
+            if st.button("Prepare the map images (ZIP of PNGs: MIL evidence, dimples, clustering)", key=f"pm{tag}"):
+                _td = tempfile.mkdtemp(prefix="m1_"); _stem = safe_name(os.path.splitext(f.name)[0])
+                save_maps((_td, [], _stem), fr, org, keep, c, lab, cl, um_px, "Brittle" if R["logit"] > 0 else "Ductile", area_pct, ds["n_dimples"])
+                _b = io.BytesIO()
+                with zipfile.ZipFile(_b, "w", zipfile.ZIP_STORED) as zo:
+                    for dp, _, fns in os.walk(_td):
+                        for fn_ in fns: zo.write(os.path.join(dp, fn_), os.path.relpath(os.path.join(dp, fn_), _td))
+                shutil.rmtree(_td, ignore_errors=True); st.session_state[f"mz{tag}"] = _b.getvalue()
+            if f"mz{tag}" in st.session_state:
+                st.download_button("Download the map images (ZIP)", st.session_state[f"mz{tag}"], f"{os.path.splitext(f.name)[0]}_maps.zip", "application/zip", key=f"z{tag}")
             st.dataframe(tab)
         with st.expander("Crop check"):
             raw = read_gray8(path); fig, ax = plt.subplots(figsize=(6, 6 * raw.shape[0] / raw.shape[1]))
@@ -352,7 +363,36 @@ def list_zip(zf):
 def peak_mb():
     import resource; return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024      # peak memory of the app so far (Linux: KB)
 
-def analyse_one(path, hfw, fast=False):
+def safe_name(x): return re.sub(r"[^\w\-. ]", "_", str(x)).strip() or "_"
+
+def save_maps(maps, fr, org, keep, c, lab, cl, um_px, decision, brittle_pct, n_dimples):
+    # three PNGs per image, written to disk under <kind>/<test>/<region>/<image>.png (zipped later on request)
+    outdir, sub, name = maps; h, w = fr.shape
+    def save(kind, fig):
+        d = os.path.join(outdir, kind, *sub); os.makedirs(d, exist_ok=True)
+        fig.savefig(os.path.join(d, name + ".png"), dpi=110, bbox_inches="tight"); plt.close(fig)
+    # 1) MIL signed evidence map
+    cmap_ = tiles_to_frame(c - TAU, org[keep], fr.shape); lim = max(1.0, np.nanpercentile(np.abs(cmap_), 99))
+    save("1_MIL_evidence_maps", fig_panel(fr, um_px, overlay=np.ma.masked_invalid(cmap_), kw=dict(cmap="coolwarm", vmin=-lim, vmax=lim, alpha=0.5),
+                                          cbar="tile score - tau", title=f"{name} | {decision} | brittle-evidence area {brittle_pct:.0f}%"))
+    # 2) dimple outlines
+    fig, ax = plt.subplots(figsize=(6, 6 * h / w)); ax.imshow(fr, cmap="gray")
+    bnd = find_boundaries(lab, mode="inner"); ov = np.zeros((*bnd.shape, 4)); ov[bnd] = (1, 0.1, 0.1, 0.9); ax.imshow(ov)
+    add_scale_bar(ax, um_px, w, h); ax.axis("off"); ax.set_title(f"{name} | {n_dimples} dimples outlined", fontsize=9); fig.tight_layout()
+    save("2_dimple_maps", fig)
+    # 3) clustering: morphology map (k-means) next to the LBP texture map
+    cm = tiles_to_frame(cl.astype(np.float32), org[keep], fr.shape)
+    fig, ax = plt.subplots(1, 2, figsize=(12, 6 * h / w))
+    ax[0].imshow(fr, cmap="gray"); ax[0].imshow(np.ma.masked_invalid(cm), cmap=ListedColormap(KM_COLORS), vmin=-0.5, vmax=KM_K - 0.5, alpha=0.5)
+    ax[0].legend(handles=[Patch(color=KM_COLORS[k], label=f"C{k}: {CLUSTER_NAMES.get(k, 'unnamed')}") for k in range(KM_K)], loc="lower right", fontsize=7)
+    ax[0].set_title(f"{name}: morphology map (k-means clusters)", fontsize=9)
+    lm = lbp_edge_map(fr, um_px); lo, hi = np.percentile(lm, [2, 98])
+    ax[1].imshow(fr, cmap="gray"); im = ax[1].imshow(lm, cmap="RdYlBu_r", vmin=lo, vmax=hi, alpha=0.5)
+    fig.colorbar(im, ax=ax[1], fraction=0.046, pad=0.02); ax[1].set_title("LBP texture map", fontsize=9)
+    for a_ in ax: a_.axis("off")
+    add_scale_bar(ax[0], um_px, w, h); fig.tight_layout(); save("3_clustering_maps", fig)
+
+def analyse_one(path, hfw, fast=False, maps=None):
     # same pipeline as the single-image tab, reduced to numbers (nothing heavy is kept in memory)
     global TTA_LIST
     old = TTA_LIST
@@ -365,11 +405,15 @@ def analyse_one(path, hfw, fast=False):
     lab, tab, dim_area = measure_dimples(fr, um_px, region); ds = dimple_summary(tab, dim_area)
     cl = MK["km"].predict(MK["pca"].transform((R["feats"] - MK["mu"]) / MK["sd"]))
     cnt = np.bincount(cl, minlength=KM_K); used_um2 = int(keep.sum()) * TILE_PX ** 2 * um_px ** 2
-    out = dict(n_dimples=ds["n_dimples"], dimple_density_per_100um2=ds["density_per_100um2"], dimple_median_diam_um=ds["diam_median_um"],
+    decision = "Brittle" if R["logit"] > 0 else "Ductile"
+    out = dict(decision=decision, n_dimples=ds["n_dimples"], dimple_density_per_100um2=ds["density_per_100um2"], dimple_median_diam_um=ds["diam_median_um"],
                p_brittle=1 / (1 + np.exp(-R["logit"])), brittle_evidence_pct=100 * float((c > TAU).mean()),
                tiles_used=int(keep.sum()), analysed_area_um2=used_um2)
     for k in range(KM_K):
         out[f"feat{k}_pct"] = 100 * cnt[k] / cnt.sum(); out[f"feat{k}_um2"] = cnt[k] * TILE_PX ** 2 * um_px ** 2
+    if maps:
+        try: save_maps(maps, fr, org, keep, c, lab, cl, um_px, decision, out["brittle_evidence_pct"], ds["n_dimples"])
+        except Exception as e: out["map_error"] = str(e)[:120]
     del R, fr, lab; gc.collect()
     return out
 
@@ -387,7 +431,9 @@ def batch_section():
     except zipfile.BadZipFile:
         st.error("This file is not a valid zip."); return
     z.seek(0); tag = hashlib.md5(z.read(200000) + f"{z.name}{z.size}".encode()).hexdigest(); z.seek(0)
-    if S.get("zip_tag") != tag: S.update(zip_tag=tag, batch_res={}, batch_fail={})
+    if S.get("zip_tag") != tag:
+        if S.get("map_dir"): shutil.rmtree(S["map_dir"], ignore_errors=True)
+        S.update(zip_tag=tag, batch_res={}, batch_fail={}, map_dir=tempfile.mkdtemp(prefix="maps_"), zip_cache=None)
     items = list_zip(zf)
     if items.empty: st.error("No images (.tif, .png, .jpg, .bmp) found in the zip."); return
 
@@ -399,11 +445,15 @@ def batch_section():
     res, fail = S["batch_res"], S["batch_fail"]
     todo = [p for p in items.path if p not in res and p not in fail]
     fast = st.checkbox("Fast mode (no test-time augmentation: about 4x quicker, scores differ slightly from the trained model)", value=False, key="fast")
+    make_maps = st.checkbox("Also save the map images (MIL evidence, dimples, clustering) for download (adds a few seconds per image)", value=True, key="make_maps")
     st.caption("Each image takes roughly 20-70 s on the free cloud CPU (a few seconds on a GPU). Keep this tab open while it runs; finished images are kept, "
                "so pressing the button again continues where it stopped. The sidebar dimple settings apply to every image.")
+    if st.button("Clear results and start over", key="reset_batch"):
+        shutil.rmtree(S.get("map_dir") or "", ignore_errors=True)
+        S.update(batch_res={}, batch_fail={}, map_dir=tempfile.mkdtemp(prefix="maps_"), zip_cache=None); st.rerun()
     if st.button(f"Analyse {len(todo)} remaining image(s)" if todo else "All images analysed", disabled=not todo, type="primary"):
         bar, status, t0 = st.progress(0.0), st.empty(), time.time()
-        rel = dict(zip(items.path, items.rel))
+        rel = dict(zip(items.path, items.rel)); where = items.set_index("path")
         for i, p in enumerate(todo):
             eta = (time.time() - t0) / i * (len(todo) - i) if i else None
             status.write(f"Image {i + 1} of {len(todo)}: {rel[p]}" + (f"  | about {eta / 60:.1f} min left" if eta else "") + f"  | peak memory {peak_mb():.0f} MB")
@@ -411,7 +461,9 @@ def batch_section():
             try:
                 with zf.open(p) as a, tempfile.NamedTemporaryFile(suffix=os.path.splitext(p)[1], delete=False) as t:
                     shutil.copyfileobj(a, t); tmp = t.name           # one image on disk at a time, deleted right after
-                r = analyse_one(tmp, hfw, fast)
+                rw = where.loc[p]
+                mp = (S["map_dir"], [safe_name(rw.test), safe_name(rw.region)], safe_name(os.path.splitext(rw.file)[0])) if make_maps else None
+                r = analyse_one(tmp, hfw, fast, mp)
                 if r is None: fail[p] = "no usable tiles (blurred or saturated)"
                 else: res[p] = r
             except Exception as e: fail[p] = str(e)
@@ -428,6 +480,19 @@ def batch_section():
     df = pd.concat([df, pd.DataFrame([res[p] for p in df.path])], axis=1)
     tests = sorted(df.test.unique(), key=natkey); regions = sorted(df.region.unique(), key=natkey)
     if len(res) < len(items): st.info(f"Graphs below cover the {len(res)} image(s) analysed so far.")
+
+    # ---- table: brittle or ductile?
+    st.markdown("### Brittle or ductile?")
+    cls = df[["test", "region", "file", "decision", "p_brittle", "brittle_evidence_pct"]].copy()
+    cls = cls.iloc[sorted(range(len(cls)), key=lambda i: (natkey(cls.test.iloc[i]), natkey(cls.region.iloc[i]), natkey(cls.file.iloc[i])))]
+    cls = cls.rename(columns={"test": "Test", "region": "Region", "file": "Image", "decision": "Decision", "p_brittle": "P(Brittle)", "brittle_evidence_pct": "Brittle-evidence area (%)"})
+    cls["P(Brittle)"] = cls["P(Brittle)"].round(3); cls["Brittle-evidence area (%)"] = cls["Brittle-evidence area (%)"].round(1)
+    st.dataframe(cls, hide_index=True)
+    cnt_tab = df.groupby(["test", "region"]).decision.agg(Brittle=lambda x: int((x == "Brittle").sum()), Ductile=lambda x: int((x == "Ductile").sum())).reset_index()
+    cnt_tab = cnt_tab.iloc[sorted(range(len(cnt_tab)), key=lambda i: (natkey(cnt_tab.test.iloc[i]), natkey(cnt_tab.region.iloc[i])))].reset_index(drop=True)
+    cnt_tab["Share brittle (%)"] = (100 * cnt_tab.Brittle / (cnt_tab.Brittle + cnt_tab.Ductile)).round(0)
+    st.markdown("Images per folder:"); st.dataframe(cnt_tab.rename(columns={"test": "Test", "region": "Region"}), hide_index=True)
+    st.caption("Decision = the Additive MIL image score (P(Brittle) above 0.5). Held-out accuracy on the training images was about 85% (AUC 0.87), so treat single images as a first pass, not a verdict.")
 
     # ---- graph 1: dimples per image, per test and region
     st.markdown("### Dimples per image")
@@ -476,6 +541,7 @@ def batch_section():
         nm = CLUSTER_NAMES.get(k, f"C{k}")
         agg[f"{nm}_pct"] = (f"feat{k}_pct", "mean"); agg[f"{nm}_um2_per_image"] = (f"feat{k}_um2", "mean")
     folder_tab = df.groupby(["test", "region"]).agg(**agg).round(3).reset_index()
+    folder_tab = folder_tab.merge(cnt_tab.rename(columns={"Brittle": "images_brittle", "Ductile": "images_ductile"}).drop(columns="Share brittle (%)"), on=["test", "region"])
     st.markdown("### Tables")
     st.dataframe(folder_tab, hide_index=True)
     c1, c2, c3, c4 = st.columns(4)
@@ -484,7 +550,32 @@ def batch_section():
     c3.download_button("Dimple graph (PNG)", png1, "dimples_comparison.png", "image/png")
     c4.download_button("Feature-area graph (PNG)", png2, "feature_area_comparison.png", "image/png")
 
+    # ---- map images as zipped folders (test/region/image.png)
+    st.markdown("### Download the map images")
+    kinds = [("1_MIL_evidence_maps", "MIL evidence maps"), ("2_dimple_maps", "Dimple maps"), ("3_clustering_maps", "Clustering maps")]
+    key = (len(res), S["map_dir"])
+    if (S.get("zip_cache") or (None,))[0] != key:
+        out_z = {}
+        for k, _ in kinds:
+            kd = os.path.join(S["map_dir"], k)
+            if not os.path.isdir(kd): continue
+            b = io.BytesIO()
+            with zipfile.ZipFile(b, "w", zipfile.ZIP_STORED) as zo:          # PNGs are already compressed
+                for dp, _, fns in os.walk(kd):
+                    for f in fns: zo.write(os.path.join(dp, f), os.path.relpath(os.path.join(dp, f), kd))
+            out_z[k] = b.getvalue()
+        S["zip_cache"] = (key, out_z)
+    zc = S["zip_cache"][1]
+    if not zc: st.info("No map images yet. Tick the map box above, press \"Clear results and start over\", and analyse again (maps are made while an image is analysed).")
+    else:
+        cols = st.columns(3)
+        for col_, (k, label) in zip(cols, kinds):
+            if k in zc: col_.download_button(f"{label} (ZIP, {len(zc[k]) / 1e6:.0f} MB)", zc[k], f"{k}.zip", "application/zip", key=f"dl_{k}")
+        st.caption("Each ZIP holds one folder per test, with a sub-folder per region and one PNG per image. Maps only exist for images analysed with the box ticked.")
+
 st.title("SEM fracture surface analysis")
+st.warning("**Please note:** the model was trained only on SEM micrographs taken at **6000× magnification** (49.7 µm field width, secondary-electron images). "
+           "Results for other magnifications, detectors or instruments are not validated and may be unreliable. Use it as a quick first pass alongside the examiner's judgement.")
 tab_single, tab_batch = st.tabs(["Single image", "Compare charging tests (zip)"])
 with tab_single: single_section()
 with tab_batch: batch_section()
