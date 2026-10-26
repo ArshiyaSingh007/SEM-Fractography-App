@@ -1,0 +1,6 @@
+[server]
+maxUploadSize = 1000
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

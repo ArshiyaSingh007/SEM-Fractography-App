@@ -1,0 +1,4 @@
+*.log
+upload_*
+__pycache__/
+*.pyc
