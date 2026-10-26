@@ -1,4 +1,4 @@
-import os, re, io, time, math, hashlib, shutil, zipfile, tempfile
+import os, re, io, gc, time, math, hashlib, shutil, zipfile, tempfile
 import numpy as np, pandas as pd, cv2, joblib
 import torch, torch.nn as nn, torch.nn.functional as F, torchvision
 import matplotlib; matplotlib.use('Agg')
@@ -195,6 +195,7 @@ class AdditiveMIL(nn.Module):
 import streamlit as st
 st.set_page_config(page_title="SEM fractography", layout="wide")
 D = os.path.dirname(os.path.abspath(__file__))
+FEAT_BATCH = min(int(FEAT_BATCH), 32)          # 256 tiles at once can exceed the free cloud's ~2.7 GB; same results, less memory
 UP = tempfile.gettempdir()          # uploads go to a temp folder (the app folder may be read-only in the cloud)
 
 @st.cache_resource
@@ -317,7 +318,7 @@ def single_section():
                        brittle_area_um2=round(area_pct / 100 * used_um2, 1), analysed_area_um2=round(used_um2, 1), tiles_used=int(keep.sum()),
                        tiles_excluded=int((~keep).sum()), um_per_px=round(um_px, 5), tau=round(TAU, 3), **ds,
                        **{f"cluster_{k}_pct": round(100 * share[k], 1) for k in range(KM_K)})
-            st.dataframe(pd.DataFrame([row]).T.rename(columns={0: "value"}))
+            st.dataframe(pd.DataFrame([row]).T.rename(columns={0: "value"}).astype(str))
             st.download_button("Download summary (CSV)", pd.DataFrame([row]).to_csv(index=False), f"{os.path.splitext(f.name)[0]}_summary.csv", "text/csv", key=f"s{tag}")
             st.download_button("Download per-dimple table (CSV)", tab.to_csv(index=False), f"{os.path.splitext(f.name)[0]}_dimples.csv", "text/csv", key=f"d{tag}")
             st.dataframe(tab)
@@ -334,32 +335,22 @@ REGION_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#B279A2", "#E45756", "#72B7B2
 
 def natkey(s): return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(s))]
 
-def safe_extract(zf, dest):
-    # extract only image files; skip macOS junk and hidden files; refuse paths that escape dest (zip-slip)
-    root, n = os.path.realpath(dest), 0
+def list_zip(zf):
+    # list the images INSIDE the zip without extracting anything. group = the folder an image sits in (region) and that folder's
+    # parent (test). Folder NAMES are never interpreted.
+    rows = []
     for info in zf.infolist():
         parts = [p for p in info.filename.replace("\\", "/").split("/") if p]
         if info.is_dir() or not parts or parts[0] == "__MACOSX" or any(p.startswith(".") for p in parts): continue
         if not parts[-1].lower().endswith(IMG_EXT_APP): continue
-        target = os.path.realpath(os.path.join(dest, *parts))
-        if not target.startswith(root + os.sep): continue
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with zf.open(info) as a, open(target, "wb") as b: shutil.copyfileobj(a, b)
-        n += 1
-    return n
-
-def scan_tree(root):
-    # group = the folder an image sits in (region) and that folder's parent (test). Folder NAMES are never interpreted.
-    rows = []
-    for dp, _, fns in os.walk(root):
-        for f in fns:
-            if not f.lower().endswith(IMG_EXT_APP): continue
-            p = os.path.join(dp, f); dirs = os.path.relpath(dp, root).replace("\\", "/").split("/")
-            dirs = [] if dirs == ["."] else dirs
-            test = dirs[-2] if len(dirs) >= 2 else (dirs[0] if len(dirs) == 1 else "(top level)")
-            region = dirs[-1] if len(dirs) >= 2 else "(no region folder)"
-            rows.append(dict(path=p, file=f, test=test, region=region, rel="/".join(dirs + [f])))
+        dirs = parts[:-1]
+        test = dirs[-2] if len(dirs) >= 2 else (dirs[0] if len(dirs) == 1 else "(top level)")
+        region = dirs[-1] if len(dirs) >= 2 else "(no region folder)"
+        rows.append(dict(path=info.filename, file=parts[-1], test=test, region=region, rel="/".join(parts)))
     return pd.DataFrame(rows, columns=["path", "file", "test", "region", "rel"])
+
+def peak_mb():
+    import resource; return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024      # peak memory of the app so far (Linux: KB)
 
 def analyse_one(path, hfw, fast=False):
     # same pipeline as the single-image tab, reduced to numbers (nothing heavy is kept in memory)
@@ -379,6 +370,7 @@ def analyse_one(path, hfw, fast=False):
                tiles_used=int(keep.sum()), analysed_area_um2=used_um2)
     for k in range(KM_K):
         out[f"feat{k}_pct"] = 100 * cnt[k] / cnt.sum(); out[f"feat{k}_um2"] = cnt[k] * TILE_PX ** 2 * um_px ** 2
+    del R, fr, lab; gc.collect()
     return out
 
 def fig_png(fig):
@@ -391,16 +383,12 @@ def batch_section():
                "Folder names do not matter: an image's region is the folder it sits in and its test is that folder's parent. Every image is analysed.")
     z = st.file_uploader("Zip of charging tests", type=["zip"], key="zip_upload")
     if z is None: return
-    zb = z.getvalue(); tag = hashlib.md5(zb[:500000] + str(len(zb)).encode()).hexdigest()
-    if S.get("zip_tag") != tag:
-        if S.get("zip_root"): shutil.rmtree(S["zip_root"], ignore_errors=True)
-        root = tempfile.mkdtemp(prefix="zipimgs_")
-        try:
-            with zipfile.ZipFile(io.BytesIO(zb)) as zf: safe_extract(zf, root)
-        except zipfile.BadZipFile:
-            st.error("This file is not a valid zip."); return
-        S.update(zip_tag=tag, zip_root=root, batch_res={}, batch_fail={})
-    items = scan_tree(S["zip_root"])
+    try: zf = zipfile.ZipFile(z)                       # read straight from the upload: no extra copies of the zip in memory
+    except zipfile.BadZipFile:
+        st.error("This file is not a valid zip."); return
+    z.seek(0); tag = hashlib.md5(z.read(200000) + f"{z.name}{z.size}".encode()).hexdigest(); z.seek(0)
+    if S.get("zip_tag") != tag: S.update(zip_tag=tag, batch_res={}, batch_fail={})
+    items = list_zip(zf)
     if items.empty: st.error("No images (.tif, .png, .jpg, .bmp) found in the zip."); return
 
     summ = items.groupby(["test", "region"]).size().rename("images").reset_index()
@@ -418,12 +406,17 @@ def batch_section():
         rel = dict(zip(items.path, items.rel))
         for i, p in enumerate(todo):
             eta = (time.time() - t0) / i * (len(todo) - i) if i else None
-            status.write(f"Image {i + 1} of {len(todo)}: {rel[p]}" + (f"  | about {eta / 60:.1f} min left" if eta else ""))
+            status.write(f"Image {i + 1} of {len(todo)}: {rel[p]}" + (f"  | about {eta / 60:.1f} min left" if eta else "") + f"  | peak memory {peak_mb():.0f} MB")
+            tmp = None
             try:
-                r = analyse_one(p, hfw, fast)
+                with zf.open(p) as a, tempfile.NamedTemporaryFile(suffix=os.path.splitext(p)[1], delete=False) as t:
+                    shutil.copyfileobj(a, t); tmp = t.name           # one image on disk at a time, deleted right after
+                r = analyse_one(tmp, hfw, fast)
                 if r is None: fail[p] = "no usable tiles (blurred or saturated)"
                 else: res[p] = r
             except Exception as e: fail[p] = str(e)
+            finally:
+                if tmp and os.path.exists(tmp): os.remove(tmp)
             bar.progress((i + 1) / len(todo))
         status.write(f"Done: {len(todo)} image(s) in {(time.time() - t0) / 60:.1f} min.")
     if fail:
