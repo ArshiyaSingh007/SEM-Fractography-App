@@ -443,6 +443,7 @@ def batch_section():
     st.dataframe(summ.rename(columns={"test": "Test folder", "region": "Region folder", "images": "Images"}), hide_index=True)
 
     res, fail = S["batch_res"], S["batch_fail"]
+    for p_ in [p_ for p_, r_ in res.items() if "decision" not in r_]: del res[p_]       # results kept from an older app version: re-analyse them
     todo = [p for p in items.path if p not in res and p not in fail]
     fast = st.checkbox("Fast mode (no test-time augmentation: about 4x quicker, scores differ slightly from the trained model)", value=False, key="fast")
     make_maps = st.checkbox("Also save the map images (MIL evidence, dimples, clustering) for download (adds a few seconds per image)", value=True, key="make_maps")
