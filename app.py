@@ -392,33 +392,93 @@ def save_maps(maps, fr, org, keep, c, lab, cl, um_px, decision, brittle_pct, n_d
     for a_ in ax: a_.axis("off")
     add_scale_bar(ax[0], um_px, w, h); fig.tight_layout(); save("3_clustering_maps", fig)
 
-def analyse_one(path, hfw, fast=False, maps=None):
-    # same pipeline as the single-image tab, reduced to numbers (nothing heavy is kept in memory)
+def classify_one(path, hfw, fast=False):
+    # STEP 1 (the slow part): tiles -> frozen ResNet50 -> Additive MIL head. Only small arrays are kept (about 1 MB per image),
+    # so the optional steps later can reuse them without running ResNet again.
     global TTA_LIST
     old = TTA_LIST
     if fast: TTA_LIST = TTA_LIST[:1]
     try: R = score_image(path, hfw)
     finally: TTA_LIST = old
     if R is None: return None
-    fr, org, keep, c = R["frame"], R["coords"], R["keep"], R["c"]; um_px = TARGET_UM_PX
+    keep, c = R["keep"], R["c"]; brittle = 100 * float((c > TAU).mean())
+    row = dict(decision="Brittle" if R["logit"] > 0 else "Ductile", p_brittle=float(1 / (1 + np.exp(-R["logit"]))),
+               brittle_area_pct=brittle, ductile_area_pct=100 - brittle, tiles_used=int(keep.sum()),
+               analysed_area_um2=int(keep.sum()) * TILE_PX ** 2 * TARGET_UM_PX ** 2, mode="fast" if fast else "full")
+    core = dict(coords=R["coords"], keep=keep, c=c, feats=R["feats"].astype(np.float16), hfw=hfw)
+    del R; gc.collect()
+    return row, core
+
+def detail_one(fr, core):
+    # STEP 2/3: dimples (watershed) and the four morphology features, from the stored tile scores and features
+    um_px = TARGET_UM_PX; org, keep, c = core["coords"], core["keep"], core["c"]
     region = ductile_region(dict(coords=org, keep=keep), c, fr.shape)
     lab, tab, dim_area = measure_dimples(fr, um_px, region); ds = dimple_summary(tab, dim_area)
-    cl = MK["km"].predict(MK["pca"].transform((R["feats"] - MK["mu"]) / MK["sd"]))
-    cnt = np.bincount(cl, minlength=KM_K); used_um2 = int(keep.sum()) * TILE_PX ** 2 * um_px ** 2
-    decision = "Brittle" if R["logit"] > 0 else "Ductile"
-    out = dict(decision=decision, n_dimples=ds["n_dimples"], dimple_density_per_100um2=ds["density_per_100um2"], dimple_median_diam_um=ds["diam_median_um"],
-               p_brittle=1 / (1 + np.exp(-R["logit"])), brittle_evidence_pct=100 * float((c > TAU).mean()),
-               tiles_used=int(keep.sum()), analysed_area_um2=used_um2)
+    cl = MK["km"].predict(MK["pca"].transform((core["feats"].astype(np.float32) - MK["mu"]) / MK["sd"]))
+    cnt = np.bincount(cl, minlength=KM_K)
+    out = dict(n_dimples=ds["n_dimples"], dimple_density_per_100um2=ds["density_per_100um2"], dimple_median_diam_um=ds["diam_median_um"])
     for k in range(KM_K):
         out[f"feat{k}_pct"] = 100 * cnt[k] / cnt.sum(); out[f"feat{k}_um2"] = cnt[k] * TILE_PX ** 2 * um_px ** 2
-    if maps:
-        try: save_maps(maps, fr, org, keep, c, lab, cl, um_px, decision, out["brittle_evidence_pct"], ds["n_dimples"])
-        except Exception as e: out["map_error"] = str(e)[:120]
-    del R, fr, lab; gc.collect()
-    return out
+    return out, lab, cl
+
+def with_frame(zf, p, hfw, fn):
+    # pull ONE image out of the zip into a temp file, load it, run fn(frame), delete the temp file
+    tmp = None
+    try:
+        with zf.open(p) as a, tempfile.NamedTemporaryFile(suffix=os.path.splitext(p)[1], delete=False) as t:
+            shutil.copyfileobj(a, t); tmp = t.name
+        fr, _ = load_frame(tmp, hfw)
+        return fn(fr)
+    finally:
+        if tmp and os.path.exists(tmp): os.remove(tmp)
 
 def fig_png(fig):
     b = io.BytesIO(); fig.savefig(b, format="png", dpi=200, bbox_inches="tight"); return b.getvalue()
+
+def ductility_scatter(df, tests, regions):
+    # one dot per image. y = ductility loss = brittle-evidence area (% of analysed surface). Ring = image classified Brittle.
+    from matplotlib.lines import Line2D
+    fig, ax = plt.subplots(figsize=(max(6.5, 1.6 * len(tests) + 2.5), 4.8)); rng = np.random.RandomState(0)
+    off = lambda j: (j - (len(regions) - 1) / 2) * 0.24
+    ax.axhline(5, color="#999", lw=1, ls=":", zorder=0)
+    ax.text(len(tests) - 0.5, 5.6, "≈5% is expected even on a fully ductile image", ha="right", va="bottom", fontsize=7, color="#777")
+    for j, r in enumerate(regions):
+        sub = df[df.region == r]
+        if sub.empty: continue
+        col = REGION_COLORS[j % 6]
+        xs = np.array([tests.index(t) for t in sub.test]) + off(j) + rng.uniform(-0.06, 0.06, len(sub)); ys = sub.brittle_area_pct.values
+        isb = (sub.decision == "Brittle").values
+        ax.scatter(xs[~isb], ys[~isb], s=48, color=col, alpha=0.9, edgecolor="white", linewidth=0.7, zorder=3)
+        ax.scatter(xs[isb], ys[isb], s=78, color=col, edgecolor="black", linewidth=1.8, zorder=4)
+        mean = sub.groupby("test").brittle_area_pct.mean(); mean = mean.iloc[sorted(range(len(mean)), key=lambda i: tests.index(mean.index[i]))]
+        mx = [tests.index(t) + off(j) for t in mean.index]
+        ax.plot(mx, mean.values, color=col, lw=1.3, ls="--", alpha=0.8, zorder=2); ax.scatter(mx, mean.values, marker="_", s=520, color=col, linewidth=3, zorder=5)
+    ax.set_xticks(range(len(tests))); ax.set_xticklabels(tests, rotation=20 if len(tests) > 4 else 0, ha="right" if len(tests) > 4 else "center")
+    ax.set_xlim(-0.6, len(tests) - 0.4); ax.set_ylim(-3, max(20, float(df.brittle_area_pct.max()) * 1.15))
+    ax.set_ylabel("Ductility loss (% brittle-evidence area)"); ax.set_xlabel("charging test")
+    ax.set_title("Ductility loss per image (dash = folder mean)", fontsize=10)
+    hs = [Line2D([], [], marker="o", ls="", color=REGION_COLORS[j % 6], label=r) for j, r in enumerate(regions)]
+    hs.append(Line2D([], [], marker="o", ls="", markerfacecolor="white", markeredgecolor="black", markeredgewidth=1.8, label="classified Brittle"))
+    ax.legend(handles=hs, frameon=False, bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=8)
+    for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+    fig.tight_layout(); return fig
+
+def dimple_scatter(df, regions):
+    from matplotlib.lines import Line2D
+    fig, ax = plt.subplots(figsize=(6.5, 4.6))
+    for j, r in enumerate(regions):
+        sub = df[df.region == r]
+        if sub.empty: continue
+        isb = (sub.decision == "Brittle").values; col = REGION_COLORS[j % 6]
+        ax.scatter(sub.dimple_density_per_100um2[~isb], sub.brittle_area_pct[~isb], s=48, color=col, edgecolor="white", linewidth=0.7)
+        ax.scatter(sub.dimple_density_per_100um2[isb], sub.brittle_area_pct[isb], s=78, color=col, edgecolor="black", linewidth=1.8)
+    ax.set_xlabel("dimple density (per 100 µm² of ductile area)"); ax.set_ylabel("Ductility loss (% brittle-evidence area)")
+    ax.set_title("Ductility loss against dimple density, one dot per image", fontsize=10)
+    hs = [Line2D([], [], marker="o", ls="", color=REGION_COLORS[j % 6], label=r) for j, r in enumerate(regions)]
+    hs.append(Line2D([], [], marker="o", ls="", markerfacecolor="white", markeredgecolor="black", markeredgewidth=1.8, label="classified Brittle"))
+    ax.legend(handles=hs, frameon=False, bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=8)
+    for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+    fig.tight_layout(); return fig
 
 def batch_section():
     S = st.session_state
@@ -431,9 +491,10 @@ def batch_section():
     except zipfile.BadZipFile:
         st.error("This file is not a valid zip."); return
     z.seek(0); tag = hashlib.md5(z.read(200000) + f"{z.name}{z.size}".encode()).hexdigest(); z.seek(0)
-    if S.get("zip_tag") != tag:
-        if S.get("map_dir"): shutil.rmtree(S["map_dir"], ignore_errors=True)
-        S.update(zip_tag=tag, batch_res={}, batch_fail={}, map_dir=tempfile.mkdtemp(prefix="maps_"), zip_cache=None)
+    def reset_all():
+        shutil.rmtree(S.get("map_dir") or "", ignore_errors=True)
+        S.update(zip_tag=tag, batch_res={}, batch_core={}, batch_fail={}, batch_detail={}, map_done=set(), zip_cache=None, map_dir=tempfile.mkdtemp(prefix="maps_"))
+    if S.get("zip_tag") != tag or "batch_core" not in S: reset_all()
     items = list_zip(zf)
     if items.empty: st.error("No images (.tif, .png, .jpg, .bmp) found in the zip."); return
 
@@ -442,31 +503,28 @@ def batch_section():
     st.markdown(f"**Detected {len(items)} images in {summ.test.nunique()} test folder(s) and {len(summ)} region folder(s).** Check this before running:")
     st.dataframe(summ.rename(columns={"test": "Test folder", "region": "Region folder", "images": "Images"}), hide_index=True)
 
-    res, fail = S["batch_res"], S["batch_fail"]
-    for p_ in [p_ for p_, r_ in res.items() if "decision" not in r_]: del res[p_]       # results kept from an older app version: re-analyse them
+    res, core, fail, detail = S["batch_res"], S["batch_core"], S["batch_fail"], S["batch_detail"]
+    for p_ in [p_ for p_ in res if p_ not in core or "ductile_area_pct" not in res[p_]]: res.pop(p_)           # results kept from an older app version
     todo = [p for p in items.path if p not in res and p not in fail]
-    fast = st.checkbox("Fast mode (no test-time augmentation: about 4x quicker, scores differ slightly from the trained model)", value=False, key="fast")
-    make_maps = st.checkbox("Also save the map images (MIL evidence, dimples, clustering) for download (adds a few seconds per image)", value=True, key="make_maps")
-    st.caption("Each image takes roughly 20-70 s on the free cloud CPU (a few seconds on a GPU). Keep this tab open while it runs; finished images are kept, "
-               "so pressing the button again continues where it stopped. The sidebar dimple settings apply to every image.")
-    if st.button("Clear results and start over", key="reset_batch"):
-        shutil.rmtree(S.get("map_dir") or "", ignore_errors=True)
-        S.update(batch_res={}, batch_fail={}, map_dir=tempfile.mkdtemp(prefix="maps_"), zip_cache=None); st.rerun()
-    if st.button(f"Analyse {len(todo)} remaining image(s)" if todo else "All images analysed", disabled=not todo, type="primary"):
+    fast = st.checkbox("Fast mode: about 4x quicker, but scores differ slightly from the trained model (fine for a first look)", value=False, key="fast")
+    st.caption("Step 1 is the slow one: roughly 20-65 s per image on the free cloud CPU (about a quarter of that in fast mode). Keep this tab open while it runs. "
+               "Finished images are kept, so pressing the button again continues where it stopped.")
+    c_a, c_b = st.columns([3, 1])
+    run1 = c_a.button(f"Step 1: classify {len(todo)} image(s) as brittle or ductile" if todo else "Step 1 done: all images classified", disabled=not todo, type="primary", key="run1")
+    if c_b.button("Clear results and start over", key="reset_batch"):
+        reset_all(); st.rerun()
+    if run1:
         bar, status, t0 = st.progress(0.0), st.empty(), time.time()
-        rel = dict(zip(items.path, items.rel)); where = items.set_index("path")
         for i, p in enumerate(todo):
             eta = (time.time() - t0) / i * (len(todo) - i) if i else None
-            status.write(f"Image {i + 1} of {len(todo)}: {rel[p]}" + (f"  | about {eta / 60:.1f} min left" if eta else "") + f"  | peak memory {peak_mb():.0f} MB")
+            status.write(f"Image {i + 1} of {len(todo)}: {items.rel[items.path == p].iloc[0]}" + (f"  | about {eta / 60:.1f} min left" if eta else "") + f"  | peak memory {peak_mb():.0f} MB")
             tmp = None
             try:
                 with zf.open(p) as a, tempfile.NamedTemporaryFile(suffix=os.path.splitext(p)[1], delete=False) as t:
                     shutil.copyfileobj(a, t); tmp = t.name           # one image on disk at a time, deleted right after
-                rw = where.loc[p]
-                mp = (S["map_dir"], [safe_name(rw.test), safe_name(rw.region)], safe_name(os.path.splitext(rw.file)[0])) if make_maps else None
-                r = analyse_one(tmp, hfw, fast, mp)
+                r = classify_one(tmp, hfw, fast)
                 if r is None: fail[p] = "no usable tiles (blurred or saturated)"
-                else: res[p] = r
+                else: res[p], core[p] = r
             except Exception as e: fail[p] = str(e)
             finally:
                 if tmp and os.path.exists(tmp): os.remove(tmp)
@@ -480,82 +538,134 @@ def batch_section():
     df = items[items.path.isin(res)].reset_index(drop=True)
     df = pd.concat([df, pd.DataFrame([res[p] for p in df.path])], axis=1)
     tests = sorted(df.test.unique(), key=natkey); regions = sorted(df.region.unique(), key=natkey)
-    if len(res) < len(items): st.info(f"Graphs below cover the {len(res)} image(s) analysed so far.")
+    if len(res) < len(items): st.info(f"Results below cover the {len(res)} image(s) classified so far.")
+    nat = lambda d: d.iloc[sorted(range(len(d)), key=lambda i: (natkey(d.test.iloc[i]), natkey(d.region.iloc[i]), natkey(d.file.iloc[i]) if "file" in d else 0))].reset_index(drop=True)
 
-    # ---- table: brittle or ductile?
-    st.markdown("### Brittle or ductile?")
-    cls = df[["test", "region", "file", "decision", "p_brittle", "brittle_evidence_pct"]].copy()
-    cls = cls.iloc[sorted(range(len(cls)), key=lambda i: (natkey(cls.test.iloc[i]), natkey(cls.region.iloc[i]), natkey(cls.file.iloc[i])))]
-    cls = cls.rename(columns={"test": "Test", "region": "Region", "file": "Image", "decision": "Decision", "p_brittle": "P(Brittle)", "brittle_evidence_pct": "Brittle-evidence area (%)"})
-    cls["P(Brittle)"] = cls["P(Brittle)"].round(3); cls["Brittle-evidence area (%)"] = cls["Brittle-evidence area (%)"].round(1)
+    # =================== RESULTS OF STEP 1 ===================
+    st.markdown("## Brittle or ductile?")
+    m = st.columns(4)
+    m[0].metric("Images classified", len(df)); m[1].metric("Classified Brittle", int((df.decision == "Brittle").sum()))
+    m[2].metric("Mean brittle area", f"{df.brittle_area_pct.mean():.1f} %"); m[3].metric("Mean ductile area", f"{df.ductile_area_pct.mean():.1f} %")
+    cls = nat(df)[["test", "region", "file", "decision", "p_brittle", "brittle_area_pct", "ductile_area_pct"]]
+    cls = cls.rename(columns={"test": "Test", "region": "Region", "file": "Image", "decision": "Decision", "p_brittle": "P(Brittle)",
+                              "brittle_area_pct": "Brittle area (%)", "ductile_area_pct": "Ductile area (%)"})
+    cls[["P(Brittle)"]] = cls[["P(Brittle)"]].round(3); cls[["Brittle area (%)", "Ductile area (%)"]] = cls[["Brittle area (%)", "Ductile area (%)"]].round(1)
     st.dataframe(cls, hide_index=True)
-    cnt_tab = df.groupby(["test", "region"]).decision.agg(Brittle=lambda x: int((x == "Brittle").sum()), Ductile=lambda x: int((x == "Ductile").sum())).reset_index()
-    cnt_tab = cnt_tab.iloc[sorted(range(len(cnt_tab)), key=lambda i: (natkey(cnt_tab.test.iloc[i]), natkey(cnt_tab.region.iloc[i])))].reset_index(drop=True)
-    cnt_tab["Share brittle (%)"] = (100 * cnt_tab.Brittle / (cnt_tab.Brittle + cnt_tab.Ductile)).round(0)
-    st.markdown("Images per folder:"); st.dataframe(cnt_tab.rename(columns={"test": "Test", "region": "Region"}), hide_index=True)
-    st.caption("Decision = the Additive MIL image score (P(Brittle) above 0.5). Held-out accuracy on the training images was about 85% (AUC 0.87), so treat single images as a first pass, not a verdict.")
+    fold = df.groupby(["test", "region"]).agg(Images=("file", "count"), Brittle_images=("decision", lambda x: int((x == "Brittle").sum())),
+                                              Ductile_images=("decision", lambda x: int((x == "Ductile").sum())), brittle_mean=("brittle_area_pct", "mean"),
+                                              brittle_sem=("brittle_area_pct", "sem"), ductile_mean=("ductile_area_pct", "mean")).reset_index()
+    fold = nat(fold).rename(columns={"test": "Test", "region": "Region", "Brittle_images": "Images classified Brittle", "Ductile_images": "Images classified Ductile",
+                                     "brittle_mean": "Mean brittle area (%)", "brittle_sem": "s.e.m.", "ductile_mean": "Mean ductile area (%)"}).round(1)
+    st.markdown("**Per test and region:**"); st.dataframe(fold, hide_index=True)
+    st.caption("Decision = the Additive MIL image score (P(Brittle) above 0.5). Brittle area = share of usable 3.1 µm tiles whose evidence score is above the threshold "
+               "(set so about 5% of tiles on a truly ductile image count as brittle). Held-out accuracy on the training images was about 85% (AUC 0.87), so treat single images as a first pass.")
 
-    # ---- graph 1: dimples per image, per test and region
-    st.markdown("### Dimples per image")
-    what = st.radio("Show", ["Average number of dimples per image", "Dimple density (per 100 µm² of ductile area)"], horizontal=True, key="dimple_what")
-    col = "n_dimples" if what.startswith("Average") else "dimple_density_per_100um2"
-    g = df.groupby(["test", "region"])[col].agg(["mean", "sem", "count"]).fillna({"sem": 0})
-    fig, ax = plt.subplots(figsize=(max(6.5, 1.4 * len(tests) * max(1, len(regions) * 0.7)), 4.4)); wd = 0.8 / len(regions)
-    for j, r in enumerate(regions):
-        xs = [i + (j - (len(regions) - 1) / 2) * wd for i, t in enumerate(tests) if (t, r) in g.index]
-        rr = [g.loc[(t, r)] for t in tests if (t, r) in g.index]
-        if not rr: continue
-        ax.bar(xs, [v["mean"] for v in rr], wd * 0.92, yerr=[v["sem"] for v in rr], capsize=3, color=REGION_COLORS[j % 6], label=r, ecolor="#333")
-        for x, v in zip(xs, rr): ax.text(x, v["mean"] + v["sem"], f"n={int(v['count'])}", ha="center", va="bottom", fontsize=7, color="#444")
-    ax.set_xticks(range(len(tests))); ax.set_xticklabels(tests, rotation=20 if len(tests) > 4 else 0, ha="right" if len(tests) > 4 else "center")
-    ax.set_ylabel("dimples per image" if col == "n_dimples" else "dimples per 100 µm²"); ax.set_xlabel("charging test")
-    ax.set_title("Mean ± s.e.m. over the images in each region folder", fontsize=10); ax.legend(title="region", frameon=False)
-    for sp in ("top", "right"): ax.spines[sp].set_visible(False)
-    fig.tight_layout(); st.pyplot(fig); png1 = fig_png(fig); plt.close(fig)
-    st.caption("Dimples are counted inside ductile-evidence tiles only (cleavage facets are never counted), so a region with more brittle area has fewer countable dimples. "
-               "The density option divides by the ductile area to remove that effect.")
+    st.markdown("### Ductility loss")
+    fig = ductility_scatter(df, tests, regions); st.pyplot(fig); png_loss = fig_png(fig); plt.close(fig)
+    st.caption("Ductility loss here means the share of the fracture surface the model reads as brittle (100% minus the ductile area). It is an image-based proxy for hydrogen "
+               "embrittlement, not a mechanical ductility measurement. Tests are ordered by name, so the dashed lines only make sense if the names sort in charging order.")
+    d1, d2_, d3 = st.columns(3)
+    d1.download_button("Per-image table (CSV)", cls.to_csv(index=False), "brittle_ductile_per_image.csv", "text/csv", key="dl_cls")
+    d2_.download_button("Per-folder table (CSV)", fold.to_csv(index=False), "brittle_ductile_per_folder.csv", "text/csv", key="dl_fold")
+    d3.download_button("Ductility-loss plot (PNG)", png_loss, "ductility_loss.png", "image/png", key="dl_loss")
 
-    # ---- graph 2: area of the four features per folder
-    st.markdown("### Area occupied by the four features")
-    unit = st.radio("Show", ["% of analysed area", "µm² per image"], horizontal=True, key="area_unit")
-    sfx = "pct" if unit.startswith("%") else "um2"
-    folders = [(t, r) for t in tests for r in regions if ((df.test == t) & (df.region == r)).any()]
-    M = pd.DataFrame({k: [df[(df.test == t) & (df.region == r)][f"feat{k}_{sfx}"].mean() for t, r in folders] for k in range(KM_K)})
-    fig, ax = plt.subplots(figsize=(max(6.5, 0.9 * len(folders) + 2), 4.8)); bottom = np.zeros(len(folders))
-    for k in range(KM_K):
-        ax.bar(range(len(folders)), M[k], bottom=bottom, color=KM_COLORS[k], label=CLUSTER_NAMES.get(k, f"C{k}"), width=0.75)
-        for i, v in enumerate(M[k]):
-            if v >= (5 if sfx == "pct" else 0.06 * M.sum(axis=1).max()): ax.text(i, bottom[i] + v / 2, f"{v:.0f}" if sfx == "pct" else f"{v:.0f}", ha="center", va="center", fontsize=7, color="white")
-        bottom += M[k].values
-    ax.set_xticks(range(len(folders))); ax.set_xticklabels([f"{t}\n{r}" for t, r in folders], rotation=35 if len(folders) > 6 else 0, ha="right" if len(folders) > 6 else "center", fontsize=8)
-    ax.set_ylabel("% of analysed area" if sfx == "pct" else "µm² per image"); ax.set_title("Mean over the images in each region folder", fontsize=10)
-    ax.legend(title="feature", frameon=False, bbox_to_anchor=(1.01, 1), loc="upper left")
-    for sp in ("top", "right"): ax.spines[sp].set_visible(False)
-    fig.tight_layout(); st.pyplot(fig); png2 = fig_png(fig); plt.close(fig)
-    st.caption("Area = share of usable 3.1 µm tiles assigned to each unsupervised morphology cluster, so it is approximate (tile resolution) and the names describe appearance, "
-               "not a validated fractographic classification.")
+    # =================== OPTIONAL STEP 2: dimples + features ===================
+    st.markdown("---"); st.markdown("## Optional: dimples and feature areas")
+    miss = [p for p in res if p not in detail]
+    st.write(f"Counts the dimples and measures the area of the four features for each image ({len(res) - len(miss)} of {len(res)} done). "
+             "This reuses the Step 1 results, so it only takes a few seconds per image.")
+    b1, b2 = st.columns(2)
+    go2 = b1.button(f"Measure dimples and feature areas ({len(miss)} image(s))", disabled=not miss, key="run2")
+    redo2 = b2.button("Redo all with the current sidebar dimple settings", disabled=len(detail) == 0, key="redo2")
+    if go2 or redo2:
+        if redo2: detail.clear()
+        todo2 = [p for p in res if p not in detail]; bar, t0 = st.progress(0.0), time.time()
+        for i, p in enumerate(todo2):
+            try: detail[p] = with_frame(zf, p, core[p]["hfw"], lambda fr, p=p: detail_one(fr, core[p])[0])
+            except Exception as e: fail[p] = f"dimple step: {e}"
+            bar.progress((i + 1) / len(todo2))
+        st.success(f"Done in {(time.time() - t0) / 60:.1f} min.")
+    if detail:
+        d2 = df[df.path.isin(detail)].reset_index(drop=True)
+        d2 = pd.concat([d2, pd.DataFrame([detail[p] for p in d2.path])], axis=1)
+        # ---- graph 1: dimples per image, per test and region
+        st.markdown("### Dimples per image")
+        what = st.radio("Show", ["Average number of dimples per image", "Dimple density (per 100 µm² of ductile area)"], horizontal=True, key="dimple_what")
+        col = "n_dimples" if what.startswith("Average") else "dimple_density_per_100um2"
+        g = d2.groupby(["test", "region"])[col].agg(["mean", "sem", "count"]).fillna({"sem": 0})
+        fig, ax = plt.subplots(figsize=(max(6.5, 1.4 * len(tests) * max(1, len(regions) * 0.7)), 4.4)); wd = 0.8 / len(regions)
+        for j, r in enumerate(regions):
+            xs = [i + (j - (len(regions) - 1) / 2) * wd for i, t in enumerate(tests) if (t, r) in g.index]
+            rr = [g.loc[(t, r)] for t in tests if (t, r) in g.index]
+            if not rr: continue
+            ax.bar(xs, [v["mean"] for v in rr], wd * 0.92, yerr=[v["sem"] for v in rr], capsize=3, color=REGION_COLORS[j % 6], label=r, ecolor="#333")
+            for x, v in zip(xs, rr): ax.text(x, v["mean"] + v["sem"], f"n={int(v['count'])}", ha="center", va="bottom", fontsize=7, color="#444")
+        ax.set_xticks(range(len(tests))); ax.set_xticklabels(tests, rotation=20 if len(tests) > 4 else 0, ha="right" if len(tests) > 4 else "center")
+        ax.set_ylabel("dimples per image" if col == "n_dimples" else "dimples per 100 µm²"); ax.set_xlabel("charging test")
+        ax.set_title("Mean ± s.e.m. over the images in each region folder", fontsize=10); ax.legend(title="region", frameon=False)
+        for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+        fig.tight_layout(); st.pyplot(fig); png1 = fig_png(fig); plt.close(fig)
+        st.caption("Dimples are counted inside ductile-evidence tiles only (cleavage facets are never counted), so a region with more brittle area has fewer countable dimples. "
+                   "The density option divides by the ductile area to remove that effect.")
 
-    # ---- tables + downloads
-    agg = {"images": ("file", "count"), "dimples_mean": ("n_dimples", "mean"), "dimples_sem": ("n_dimples", "sem"),
-           "density_per_100um2_mean": ("dimple_density_per_100um2", "mean")}
-    for k in range(KM_K):
-        nm = CLUSTER_NAMES.get(k, f"C{k}")
-        agg[f"{nm}_pct"] = (f"feat{k}_pct", "mean"); agg[f"{nm}_um2_per_image"] = (f"feat{k}_um2", "mean")
-    folder_tab = df.groupby(["test", "region"]).agg(**agg).round(3).reset_index()
-    folder_tab = folder_tab.merge(cnt_tab.rename(columns={"Brittle": "images_brittle", "Ductile": "images_ductile"}).drop(columns="Share brittle (%)"), on=["test", "region"])
-    st.markdown("### Tables")
-    st.dataframe(folder_tab, hide_index=True)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("Per-folder summary (CSV)", folder_tab.to_csv(index=False), "folder_summary.csv", "text/csv")
-    c2.download_button("Per-image results (CSV)", df.drop(columns=["path"]).round(4).to_csv(index=False), "per_image_results.csv", "text/csv")
-    c3.download_button("Dimple graph (PNG)", png1, "dimples_comparison.png", "image/png")
-    c4.download_button("Feature-area graph (PNG)", png2, "feature_area_comparison.png", "image/png")
 
-    # ---- map images as zipped folders (test/region/image.png)
-    st.markdown("### Download the map images")
+        # ---- graph 2: area of the four features per folder
+        st.markdown("### Area occupied by the four features")
+        unit = st.radio("Show", ["% of analysed area", "µm² per image"], horizontal=True, key="area_unit")
+        sfx = "pct" if unit.startswith("%") else "um2"
+        folders = [(t, r) for t in tests for r in regions if ((d2.test == t) & (d2.region == r)).any()]
+        M = pd.DataFrame({k: [d2[(d2.test == t) & (d2.region == r)][f"feat{k}_{sfx}"].mean() for t, r in folders] for k in range(KM_K)})
+        fig, ax = plt.subplots(figsize=(max(6.5, 0.9 * len(folders) + 2), 4.8)); bottom = np.zeros(len(folders))
+        for k in range(KM_K):
+            ax.bar(range(len(folders)), M[k], bottom=bottom, color=KM_COLORS[k], label=CLUSTER_NAMES.get(k, f"C{k}"), width=0.75)
+            for i, v in enumerate(M[k]):
+                if v >= (5 if sfx == "pct" else 0.06 * M.sum(axis=1).max()): ax.text(i, bottom[i] + v / 2, f"{v:.0f}" if sfx == "pct" else f"{v:.0f}", ha="center", va="center", fontsize=7, color="white")
+            bottom += M[k].values
+        ax.set_xticks(range(len(folders))); ax.set_xticklabels([f"{t}\n{r}" for t, r in folders], rotation=35 if len(folders) > 6 else 0, ha="right" if len(folders) > 6 else "center", fontsize=8)
+        ax.set_ylabel("% of analysed area" if sfx == "pct" else "µm² per image"); ax.set_title("Mean over the images in each region folder", fontsize=10)
+        ax.legend(title="feature", frameon=False, bbox_to_anchor=(1.01, 1), loc="upper left")
+        for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+        fig.tight_layout(); st.pyplot(fig); png2 = fig_png(fig); plt.close(fig)
+        st.caption("Area = share of usable 3.1 µm tiles assigned to each unsupervised morphology cluster, so it is approximate (tile resolution) and the names describe appearance, "
+                   "not a validated fractographic classification.")
+
+        st.markdown("### Ductility loss against dimple density")
+        fig = dimple_scatter(d2, regions); st.pyplot(fig); png3 = fig_png(fig); plt.close(fig)
+        agg = {"images": ("file", "count"), "dimples_mean": ("n_dimples", "mean"), "dimples_sem": ("n_dimples", "sem"),
+               "density_per_100um2_mean": ("dimple_density_per_100um2", "mean"), "ductility_loss_pct_mean": ("brittle_area_pct", "mean")}
+        for k in range(KM_K):
+            nm = CLUSTER_NAMES.get(k, f"C{k}")
+            agg[f"{nm}_pct"] = (f"feat{k}_pct", "mean"); agg[f"{nm}_um2_per_image"] = (f"feat{k}_um2", "mean")
+        folder_tab = nat(d2.groupby(["test", "region"]).agg(**agg).round(3).reset_index())
+        st.markdown("### Tables"); st.dataframe(folder_tab, hide_index=True)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.download_button("Per-folder summary (CSV)", folder_tab.to_csv(index=False), "folder_summary.csv", "text/csv", key="dl_f2")
+        c2.download_button("Per-image results (CSV)", d2.drop(columns=["path"]).round(4).to_csv(index=False), "per_image_results.csv", "text/csv", key="dl_i2")
+        c3.download_button("Dimple graph (PNG)", png1, "dimples_comparison.png", "image/png", key="dl_p1")
+        c4.download_button("Feature-area graph (PNG)", png2, "feature_area_comparison.png", "image/png", key="dl_p2")
+        c5.download_button("Loss vs dimples (PNG)", png3, "ductility_loss_vs_dimples.png", "image/png", key="dl_p3")
+
+    # =================== OPTIONAL STEP 3: map images ===================
+    st.markdown("---"); st.markdown("## Optional: map images")
+    mdone = S["map_done"]; mmiss = [p for p in res if p not in mdone]
+    st.write("**Would you like the map images?** This makes three PNGs per image (MIL evidence map, dimple outlines, clustering maps) and packs them into one ZIP per map type, "
+             f"with a folder per test and region ({len(mdone)} of {len(res)} images done). A few seconds per image.")
+    if st.button(f"Create map images for {len(mmiss)} image(s)", disabled=not mmiss, key="run3"):
+        bar, t0 = st.progress(0.0), time.time(); where = items.set_index("path")
+        for i, p in enumerate(mmiss):
+            rw = where.loc[p]
+            def make(fr, p=p, rw=rw):
+                out, lab, cl = detail_one(fr, core[p])
+                if p not in detail: detail[p] = out
+                save_maps((S["map_dir"], [safe_name(rw.test), safe_name(rw.region)], safe_name(os.path.splitext(rw.file)[0])), fr, core[p]["coords"], core[p]["keep"], core[p]["c"],
+                          lab, cl, TARGET_UM_PX, res[p]["decision"], res[p]["brittle_area_pct"], out["n_dimples"])
+            try: with_frame(zf, p, core[p]["hfw"], make); mdone.add(p)
+            except Exception as e: fail[p] = f"map step: {e}"
+            bar.progress((i + 1) / len(mmiss))
+        st.success(f"Done in {(time.time() - t0) / 60:.1f} min."); S["zip_cache"] = None
     kinds = [("1_MIL_evidence_maps", "MIL evidence maps"), ("2_dimple_maps", "Dimple maps"), ("3_clustering_maps", "Clustering maps")]
-    key = (len(res), S["map_dir"])
-    if (S.get("zip_cache") or (None,))[0] != key:
+    key = (len(mdone), S["map_dir"])
+    if mdone and (S.get("zip_cache") or (None,))[0] != key:
         out_z = {}
         for k, _ in kinds:
             kd = os.path.join(S["map_dir"], k)
@@ -566,13 +676,12 @@ def batch_section():
                     for f in fns: zo.write(os.path.join(dp, f), os.path.relpath(os.path.join(dp, f), kd))
             out_z[k] = b.getvalue()
         S["zip_cache"] = (key, out_z)
-    zc = S["zip_cache"][1]
-    if not zc: st.info("No map images yet. Tick the map box above, press \"Clear results and start over\", and analyse again (maps are made while an image is analysed).")
-    else:
+    zc = (S.get("zip_cache") or (None, {}))[1]
+    if zc:
         cols = st.columns(3)
         for col_, (k, label) in zip(cols, kinds):
             if k in zc: col_.download_button(f"{label} (ZIP, {len(zc[k]) / 1e6:.0f} MB)", zc[k], f"{k}.zip", "application/zip", key=f"dl_{k}")
-        st.caption("Each ZIP holds one folder per test, with a sub-folder per region and one PNG per image. Maps only exist for images analysed with the box ticked.")
+        st.caption("Each ZIP holds one folder per test, with a sub-folder per region and one PNG per image. Download them before leaving the page.")
 
 st.title("SEM fracture surface analysis")
 st.warning("**Please note:** the model was trained only on SEM micrographs taken at **6000× magnification** (49.7 µm field width, secondary-electron images). "
